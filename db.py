@@ -2,7 +2,6 @@ import random
 import psycopg2
 from psycopg2.extras import DictCursor
 
-
 # Данные настроек PostgreSQL
 DB_CONFIG = {
     'dbname': 'english_card_db',
@@ -14,12 +13,57 @@ DB_CONFIG = {
 
 
 def get_connection():
-    """Создаем и подключаемся к базе данных."""
+    """Создает и возвращает подключение к базе данных."""
     return psycopg2.connect(**DB_CONFIG)
 
 
+def init_db():
+    """Создает таблицы и базовые слова, если их нет."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id SERIAL PRIMARY KEY,
+                    username VARCHAR(50) UNIQUE NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS words (
+                    word_id SERIAL PRIMARY KEY,
+                    english_word VARCHAR(50) UNIQUE NOT NULL,
+                    russian_translation VARCHAR(50) NOT NULL,
+                    is_common BOOLEAN DEFAULT FALSE
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_words (
+                    user_id INTEGER REFERENCES users(user_id)
+                        ON DELETE CASCADE,
+                    word_id INTEGER REFERENCES words(word_id)
+                        ON DELETE CASCADE,
+                    correct_answers INTEGER DEFAULT 0,
+                    total_attempts INTEGER DEFAULT 0,
+                    PRIMARY KEY (user_id, word_id)
+                )
+            """)
+
+            # Добавление базовых слов (ON CONFLICT предотвращает дублирование)
+            cur.execute("""
+                INSERT INTO words
+                (english_word, russian_translation, is_common)
+                VALUES
+                ('red', 'красный', TRUE), ('blue', 'синий', TRUE),
+                ('green', 'зеленый', TRUE), ('he', 'он', TRUE),
+                ('she', 'она', TRUE), ('it', 'оно', TRUE),
+                ('house', 'дом', TRUE), ('tree', 'дерево', TRUE),
+                ('car', 'машина', TRUE), ('sun', 'солнце', TRUE)
+                ON CONFLICT (english_word) DO NOTHING
+            """)
+            conn.commit()
+
+
 def add_user_if_not_exists(username):
-    """Добавляем пользователя и привязываем 10 базовых слов."""
+    """Добавляет пользователя и возвращает его ID."""
     with get_connection() as conn:
         with conn.cursor(cursor_factory=DictCursor) as cur:
             cur.execute(
@@ -35,12 +79,6 @@ def add_user_if_not_exists(username):
                     (username,)
                 )
                 user_id = cur.fetchone()['user_id']
-
-                cur.execute("""
-                    INSERT INTO user_words (user_id, word_id)
-                    SELECT %s, word_id FROM words LIMIT 10
-                """, (user_id,))
-
                 conn.commit()
                 return user_id
 
@@ -48,34 +86,38 @@ def add_user_if_not_exists(username):
 
 
 def get_words_for_learning(user_id):
-    """Возвращает случайное слово пользователя и 4 варианта ответа."""
+    """Возвращает случайное слово (общее или личное) и 4 варианта ответа."""
     with get_connection() as conn:
         with conn.cursor(cursor_factory=DictCursor) as cur:
-            # Получаем 1 случайное слово, которое изучает пользователь
+            # Выборка: либо базовое слово, либо добавленное этим пользователем
             cur.execute("""
                 SELECT w.word_id, w.english_word, w.russian_translation
-                FROM user_words uw
-                JOIN words w ON uw.word_id = w.word_id
-                WHERE uw.user_id = %s
+                FROM words w
+                LEFT JOIN user_words uw ON w.word_id = uw.word_id
+                    AND uw.user_id = %s
+                WHERE w.is_common = TRUE OR uw.user_id = %s
                 ORDER BY RANDOM() LIMIT 1
-            """, (user_id,))
+            """, (user_id, user_id))
             target = cur.fetchone()
 
             if not target:
                 return None, []
 
-            # Получаем 3 неправильных перевода из общей базы
+            # Получаем 3 неправильных варианта перевода
             cur.execute("""
-                SELECT russian_translation FROM words
-                WHERE word_id != %s
+                SELECT w.russian_translation
+                FROM words w
+                LEFT JOIN user_words uw ON w.word_id = uw.word_id
+                    AND uw.user_id = %s
+                WHERE w.word_id != %s
+                  AND (w.is_common = TRUE OR uw.user_id = %s)
                 ORDER BY RANDOM() LIMIT 3
-            """, (target['word_id'],))
+            """, (user_id, target['word_id'], user_id))
 
             wrong_words = [
                 row['russian_translation'] for row in cur.fetchall()
             ]
 
-            # Формируем список из 4 вариантов и перемешиваем
             options = wrong_words + [target['russian_translation']]
             random.shuffle(options)
 
@@ -83,30 +125,25 @@ def get_words_for_learning(user_id):
 
 
 def update_stats(user_id, word_id, is_correct):
-    """Обновляет счетчики ответов пользователя."""
+    """Обновляет или создает запись со статистикой ответа (UPSERT)."""
+    cor_add = 1 if is_correct else 0
     with get_connection() as conn:
         with conn.cursor() as cur:
-            if is_correct:
-                cur.execute("""
-                    UPDATE user_words
-                    SET correct_answers = correct_answers + 1,
-                        total_attempts = total_attempts + 1
-                    WHERE user_id = %s AND word_id = %s
-                """, (user_id, word_id))
-            else:
-                cur.execute("""
-                    UPDATE user_words
-                    SET total_attempts = total_attempts + 1
-                    WHERE user_id = %s AND word_id = %s
-                """, (user_id, word_id))
+            cur.execute("""
+                INSERT INTO user_words
+                (user_id, word_id, correct_answers, total_attempts)
+                VALUES (%s, %s, %s, 1)
+                ON CONFLICT (user_id, word_id) DO UPDATE SET
+                correct_answers = user_words.correct_answers + %s,
+                total_attempts = user_words.total_attempts + 1
+            """, (user_id, word_id, cor_add, cor_add))
             conn.commit()
 
 
 def add_new_word(user_id, eng, rus):
-    """Добавляет новое слово в базу и привязывает к пользователю."""
+    """Добавляет личное слово в базу и привязывает к пользователю."""
     with get_connection() as conn:
         with conn.cursor(cursor_factory=DictCursor) as cur:
-            # Проверяем, есть ли уже такое английское слово в общей базе
             cur.execute(
                 "SELECT word_id FROM words WHERE english_word = %s",
                 (eng,)
@@ -116,7 +153,6 @@ def add_new_word(user_id, eng, rus):
             if res:
                 word_id = res['word_id']
             else:
-                # Если нет - добавляем
                 cur.execute(
                     "INSERT INTO words (english_word, russian_translation) "
                     "VALUES (%s, %s) RETURNING word_id",
@@ -124,7 +160,6 @@ def add_new_word(user_id, eng, rus):
                 )
                 word_id = cur.fetchone()['word_id']
 
-            # Привязываем слово к пользователю, если еще не привязано
             cur.execute(
                 "SELECT 1 FROM user_words "
                 "WHERE user_id = %s AND word_id = %s",
@@ -140,20 +175,20 @@ def add_new_word(user_id, eng, rus):
 
 
 def get_user_words(user_id):
-    """Получает список всех слов конкретного пользователя для удаления."""
+    """Получает список личных слов пользователя для удаления."""
     with get_connection() as conn:
         with conn.cursor(cursor_factory=DictCursor) as cur:
             cur.execute("""
                 SELECT w.word_id, w.english_word, w.russian_translation
                 FROM user_words uw
                 JOIN words w ON uw.word_id = w.word_id
-                WHERE uw.user_id = %s
+                WHERE uw.user_id = %s AND w.is_common = FALSE
             """, (user_id,))
             return cur.fetchall()
 
 
 def delete_user_word(user_id, word_id):
-    """Удаляет связь слова с пользователем."""
+    """Удаляет связь личного слова с пользователем."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -169,8 +204,8 @@ def get_user_stats(user_id):
     with get_connection() as conn:
         with conn.cursor(cursor_factory=DictCursor) as cur:
             cur.execute("""
-                SELECT SUM(correct_answers) as corrects,
-                       SUM(total_attempts) as totals,
+                SELECT COALESCE(SUM(correct_answers), 0) as corrects,
+                       COALESCE(SUM(total_attempts), 0) as totals,
                        COUNT(word_id) as word_count
                 FROM user_words
                 WHERE user_id = %s
